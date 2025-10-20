@@ -1,203 +1,207 @@
-#include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <ctime>
 #include <iostream>
 #include <new>
-#include <random>
+#include <vector>
 
 constexpr size_t ALIGNMENT = 1 << 12;
-size_t STEPS = 1 << 26;
-unsigned volatile char *buffer = nullptr, *eater = nullptr;
-volatile size_t *jumps = nullptr;
-size_t JUMP_SIZE = 0;
+unsigned char *buffer = nullptr;
+unsigned char *eater = nullptr;
+size_t BUFFER_SIZE = 0;
+const constexpr size_t EATER_SIZE = 1 << 26;
 
-template <typename T> void make_jumps(T &rng, size_t stride) {
-  if (jumps != nullptr)
-    delete[] jumps;
-  size_t count = JUMP_SIZE = STEPS / stride;
-  jumps = new size_t[count];
-  for (int i = 0; i < count; i++) {
-    jumps[i] = i * stride;
-  }
-  std::shuffle(jumps, jumps + count, rng);
-}
-
-template <typename T> void make_buffers(T &rng) {
-  if (jumps != nullptr) {
+void make_buffer(size_t size) {
+  if (buffer != nullptr) {
     delete[] buffer;
-    delete[] eater;
   }
-  buffer = new (std::align_val_t(ALIGNMENT)) unsigned char[STEPS];
-  eater = new (std::align_val_t(ALIGNMENT)) unsigned char[STEPS];
-  for (size_t i = 0; i < STEPS; i++) {
-    buffer[i] = rng();
-    eater[i] = rng();
+
+  buffer =
+      new (std::align_val_t(ALIGNMENT)) unsigned char[size * sizeof(void *)];
+  BUFFER_SIZE = size;
+}
+
+void make_eater() {
+  eater = new (std::align_val_t(ALIGNMENT)) unsigned char[EATER_SIZE];
+  for (size_t i = 0; i < EATER_SIZE; i++) {
+    eater[i] = i;
   }
 }
 
-using std::cout, std::endl;
-using std::mt19937;
+using std::cout, std::vector;
+
+void make_pattern(const std::vector<size_t> &pattern) {
+  size_t pos = 0;
+  constexpr size_t ptr_size = sizeof(void *);
+
+  // Make sure the pattern does not terminate too early.
+  for (auto it : pattern) {
+    *reinterpret_cast<void **>(buffer + pos * ptr_size) = nullptr;
+    pos = it;
+  }
+
+  // Generate the pattern.
+  pos = 0;
+  for (auto it : pattern) {
+    auto ptr = reinterpret_cast<void **>(buffer + pos * ptr_size);
+    assert(*ptr == nullptr);
+    *ptr = reinterpret_cast<void *>(buffer + it * ptr_size);
+    pos = it;
+  }
+  // pattern ->> cyclic
+  *reinterpret_cast<void **>(buffer + pos * ptr_size) =
+      reinterpret_cast<void *>(buffer);
+}
+
+void cycle(size_t cycles) {
+  void **pointer = reinterpret_cast<void **>(buffer);
+  while (cycles--) {
+    pointer = static_cast<void **>(*pointer);
+  }
+  // try to guarantee that a side effect happens
+  assert(pointer != nullptr);
+}
 
 void eat_cache() {
-  for (size_t i = 0; i < STEPS; i++) {
-    eater[i];
+  for (size_t i = 0; i < EATER_SIZE; i++) {
+    assert(eater[i] == static_cast<unsigned char>(i));
   }
 }
 
-template <typename F, typename... Ts>
-size_t compute_time(const F &callback, const Ts &...params) {
+double compute_time(size_t cycles, const std::vector<size_t> &pattern) {
+  make_pattern(pattern);
+  void **pointer;
+
+  // Warmup
+
+  cycle(cycles);
+  cycle(cycles);
   eat_cache();
+
+  // Perform the measurement
   auto time = std::chrono::steady_clock::now();
-  callback(params...);
+  cycle(cycles);
   auto time2 = std::chrono::steady_clock::now();
-  return (time2 - time).count();
+
+  std::chrono::duration<double> diff = time2 - time;
+  return diff.count();
 }
 
-void linelength_subroutine(size_t exp_linelength, size_t stride) {
-  for (int k = 0; k < stride; k++) {
-    for (size_t i = 0; i < STEPS; i += exp_linelength) {
-      size_t x = jumps[i];
-      for (size_t j = k; j < exp_linelength; j += stride) {
-        buffer[x + j];
-      }
+size_t compute_linelength() {
+  size_t MAX_CACHE_LINES = 1 << 16;
+  vector<size_t> pattern(MAX_CACHE_LINES);
+
+  double last_time = -1;
+  for (size_t guess = 16; guess <= 1024; guess <<= 1) {
+    for (size_t i = 0; i < MAX_CACHE_LINES; i++) {
+      // j = 0: 1 2 3 4 5 6 7 8 ... - gets optimized by prefetcher
+      // w/  j: 1 4 3 2 5 8 7 6 ...
+      size_t j = i % 2 == 0 ? 0 : (i % 4 == 1 ? 2 : -2);
+      pattern[i] = (i + 1 + j) * guess / sizeof(void *);
     }
+
+    double time = compute_time(BUFFER_SIZE, pattern);
+    cout << "Guess: " << guess << " time: " << time << std::endl;
+    if (last_time > 0 && last_time * 1.15 < time) {
+      cout << "Likely line length: " << guess << "\n\n";
+      return guess;
+    }
+    last_time = time;
   }
+
+  return 0;
 }
 
-template <typename T> size_t guess_linelength(T &rng) {
-  /*
-    Сравниваем время прохода линейки с шагом 2 дважды с временем прохода линейки
-    с шагом 1 единожды
-
-    Теория (после написания алгоритма):
-    Если длина линейки == i, то время должно отличаться мало - в 1 случае мы
-    проходим по всей линейне, а в 2 случае 2 раза её загружаем Если длина
-    линейки < i, то теряем много времени на переключение линеек, но мб и повезёт
-    Если длина линейки > i, то нужно при каждом проходе стягивать несколько
-    линеек, видимо тут проблема
-
-    Теория (реальная):
-    А фиг её знает
-
-    На -O0 не работает(
-  */
-
-  make_jumps(rng, 1);
-  size_t best_fit = 0;
-  double best_ratio = 0.1;
-  for (size_t i = 16; i <= 1024; i <<= 1) {
-    size_t fst = compute_time(linelength_subroutine, i, 1),
-           snd = compute_time(linelength_subroutine, i, 2);
-    double ratio = static_cast<double>(fst) / snd;
-    cout << "Length: " << i << ", ratio: " << ratio << "\n";
-    if (ratio > best_ratio) {
-      best_fit = i;
-      best_ratio = ratio;
+size_t compute_line_count(size_t linelength) {
+  linelength /= sizeof(void *);
+  double last_time = -1;
+  for (size_t guess = 16; guess <= 4096; guess <<= 1) {
+    vector<size_t> pattern(guess);
+    for (size_t i = 0; i < guess; i++) {
+      // see above
+      size_t j = i % 2 == 0 ? 0 : (i % 4 == 1 ? 2 : -2);
+      pattern[i] = (i + 1 + j) * linelength;
     }
+
+    double time = compute_time(BUFFER_SIZE, pattern);
+    cout << "Guess: " << guess << " time: " << time << std::endl;
+
+    if (last_time > 0 && last_time * 1.15 < time) {
+      cout << "Likely line count: " << guess / 2 << "\n\n";
+      return guess / 2;
+    }
+    last_time = time;
   }
-  return best_fit;
+
+  return 0;
 }
 
-void cachesize_subroutine(size_t guess, size_t linelength) {
-  // JUMP_SIZE ~ 1 / guess, 8 * linelength ~ 1, (target - start) ~ guess
-  for (size_t i = 0; i <= JUMP_SIZE; i++) {
-    for (size_t s = 0; s < 8 * linelength; s++) {
-      size_t start = jumps[i] * (s % 2);
-      size_t target = start + guess;
-      for (size_t j = start; j < target; j += linelength) {
-        buffer[j];
-      }
+size_t compute_associativity(size_t linelength, size_t line_count) {
+  double last_time = -1;
+  for (size_t guess = 1; guess <= line_count; guess++) {
+    if (line_count % guess != 0)
+      continue; // Associativity must be uniform
+
+    size_t pattern_size = guess + 1;
+    // If associativity = guess, then there are =guess different values, that
+    // map to the same point. Since we try to map guess + 1 values, we should
+    // encounter thrashing on every read.
+    // If associativity > guess, then we should not encounter any thrashing.
+    // Therefore, at the correct guess, we should get a major performance loss.
+    vector<size_t> pattern(pattern_size);
+    // skipping cache_size bytes will definitely be in the same associative set
+    size_t cache_size_ptrs = linelength * line_count / sizeof(void *);
+    for (size_t i = 0; i < pattern_size; i++) {
+      pattern[i] = (i + 1) * cache_size_ptrs;
     }
-  }
-}
-
-template <typename T> size_t guess_cachesize(T &rng, size_t linelength) {
-  /*
-    Пытаемся много раз пройти по кешу
-
-    Если cachesize >= i, то весь проход влезет в кеш, если cachesize < i, то
-    будут постоянные вытеснения
-  */
-
-  size_t best_fit = 0;
-  double best_ratio = 2.0;
-  for (size_t i = 1024; i <= 1048576; i <<= 1) {
-    make_jumps(rng, i);
-    size_t prev = compute_time(cachesize_subroutine, i, linelength);
-    make_jumps(rng, i >> 1);
-    size_t cur = compute_time(cachesize_subroutine, i >> 1, linelength);
-    double ratio = static_cast<double>(cur) / prev;
-    cout << "Size: " << i << ", ratio: " << ratio << "\n";
-    if (ratio < best_ratio) {
-      best_fit = i;
-      best_ratio = ratio;
+    double time = compute_time(BUFFER_SIZE, pattern);
+    cout << "Guess: " << guess << " time: " << time << std::endl;
+    // Some CPUs have much weaker thrashing effects for some reason.
+    if (last_time > 0 && last_time * 1.2 < time) {
+      cout << "Likely associativity: " << guess << "\n\n";
+      return guess;
     }
-  }
-  return best_fit;
-}
-
-void assoc_subroutine(size_t guess, size_t cache_size) {
-  size_t loop_cnt = 5000;
-  for (int i = 0; i < JUMP_SIZE; i += guess) {
-    for (int k = 0; k < loop_cnt; k++) {
-      for (int j = 0; j < guess; j++) {
-        buffer[jumps[j]];
-      }
-    }
-  }
-}
-
-template <typename T>
-size_t guess_assoc(T &rng, size_t linelength, size_t cache_size) {
-  /*
-  Пытаемся пройти по set_count+1 точкам с stride = cache_size
-
-  Если мы угадали set_count, то будут вытеснения, а на предыдущем значении guess
-  не будет вытеснений
-  */
-
-  make_jumps(rng, cache_size);
-  size_t line_count = cache_size / linelength;
-
-  size_t best_fit = 0;
-  // assoc=1 is not possible on modern machines and gives false positives
-  for (size_t i = 2; i < line_count; i++) {
-    if (line_count % i != 0)
-      // non-uniform associativity should be invalid
-      continue;
-    size_t cur = compute_time(assoc_subroutine, line_count / i, cache_size);
-    size_t next =
-        compute_time(assoc_subroutine, line_count / i / 2, cache_size);
-    double ratio = static_cast<double>(cur) / next;
-    cout << "Assoc: " << i << ", ratio: " << ratio << "\n";
-    if (ratio > 1.15) { // тут константа процессорнозависимая :(
-      best_fit = i;
-      break;
-    }
+    last_time = time;
   }
 
-  return best_fit;
+  return 1;
 }
 
 int main() {
-  cout << "Generating buffer..." << endl;
-  mt19937 rng(time(nullptr));
-  make_buffers(rng);
-  cout << "Starting computation..." << endl;
+  make_buffer(1 << 28);
+  make_eater();
+  cout << "Guessing line length; expecting minor time increase on correct guess"
+       << std::endl;
+  size_t linelength = compute_linelength();
+  if (!linelength) {
+    cout << "Unable to predict linelength";
+    return 1;
+  }
 
-  cout << "Getting linelength..." << endl;
-  int linelength = guess_linelength(rng);
-  cout << "\nGetting cache size..." << endl;
-  int cache_size = guess_cachesize(rng, linelength);
-  cout << "\nScaling buffers..." << endl;
-  STEPS = 1 << 30;
-  make_buffers(rng);
-  cout << "\nGetting assoc count..." << endl;
-  int assoc_count = guess_assoc(rng, linelength, cache_size);
+  cout << "Guessing line count; expecting minor time increase AFTER correct "
+          "guess"
+       << std::endl;
+  size_t line_count = compute_line_count(linelength);
+  if (!line_count) {
+    cout << "Unable to predict line count";
+    return 1;
+  }
 
-  cout << "\nLine length: " << linelength << "\nCache size:  " << cache_size
-       << "\nAssoc count: " << assoc_count << endl;
+  cout << "Guessing associativity; expecting MAJOR time increase on correct "
+          "guess"
+       << std::endl;
+  size_t associativity = compute_associativity(linelength, line_count);
+  if (!associativity) {
+    cout << "Unable to predict associativity";
+    return 1;
+  }
+
+  cout << "Predicted line length: " << linelength << "\n";
+  cout << "Predicted line count: " << line_count
+       << " (cache size: " << linelength * line_count << ")\n";
+  cout << "Predicted " << associativity << "-way associativity ("
+       << line_count / associativity << " lines per set)" << "\n";
+
   delete[] buffer;
   delete[] eater;
-  delete[] jumps;
 }

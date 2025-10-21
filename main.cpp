@@ -1,15 +1,21 @@
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <ctime>
 #include <iostream>
 #include <new>
+#include <thread>
 #include <vector>
+
+using ATOMIC_T = std::atomic_int64_t;
 
 constexpr size_t ALIGNMENT = 1 << 12;
 unsigned char *buffer = nullptr;
 unsigned char *eater = nullptr;
 size_t BUFFER_SIZE = 0;
 const constexpr size_t EATER_SIZE = 1 << 26;
+const constexpr size_t FALSE_SHARING_TESTLEN = 1 << 26;
+ATOMIC_T *atomics = nullptr;
 
 void make_buffer(size_t size) {
   if (buffer != nullptr) {
@@ -22,10 +28,22 @@ void make_buffer(size_t size) {
 }
 
 void make_eater() {
+  if (eater != nullptr) {
+    delete[] eater;
+  }
+
   eater = new (std::align_val_t(ALIGNMENT)) unsigned char[EATER_SIZE];
   for (size_t i = 0; i < EATER_SIZE; i++) {
     eater[i] = i;
   }
+}
+
+void make_atomics(size_t count) {
+  if (atomics != nullptr) {
+    delete[] atomics;
+  }
+
+  atomics = new (std::align_val_t(ALIGNMENT)) ATOMIC_T[count];
 }
 
 using std::cout, std::vector;
@@ -87,32 +105,51 @@ double compute_time(size_t cycles, const std::vector<size_t> &pattern) {
   return diff.count();
 }
 
+void do_false_sharing(size_t guess) {
+  for (size_t count = 0; count != FALSE_SHARING_TESTLEN; count++)
+    atomics[guess].fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_false_sharing(size_t guess) {
+  std::thread fst([]() { return do_false_sharing(0); });
+  std::thread snd([guess]() { return do_false_sharing(guess); });
+  fst.join();
+  snd.join();
+}
+
 size_t compute_linelength() {
-  size_t MAX_CACHE_LINES = 1 << 16;
-  vector<size_t> pattern(MAX_CACHE_LINES);
-
   double last_time = -1;
-  for (size_t guess = 16; guess <= 1024; guess <<= 1) {
-    for (size_t i = 0; i < MAX_CACHE_LINES; i++) {
-      pattern[i] = (i + 1) * (guess * 3 / 2) / sizeof(void *);
-    }
+  for (size_t guess = 8; guess <= 1024; guess <<= 1) {
+    auto time = std::chrono::steady_clock::now();
+    test_false_sharing(guess / sizeof(ATOMIC_T));
+    auto time2 = std::chrono::steady_clock::now();
+    std::chrono::duration<double> diff = time2 - time;
 
-    double time = compute_time(BUFFER_SIZE, pattern);
-    cout << "Guess: " << guess << " time: " << time << std::endl;
-    if (last_time > 0 && last_time * 1.2 < time) {
+    double dur = diff.count();
+    cout << "Guess: " << guess << " time: " << dur << "\n";
+    if (last_time > 0 && dur * 2 < last_time) {
       cout << "Likely line length: " << guess << "\n\n";
       return guess;
     }
-    last_time = time;
+    last_time = dur;
   }
 
   return 0;
 }
 
+bool reasonable_guess(size_t guess) {
+  while (guess % 2 == 0)
+    guess >>= 1;
+  return guess < 8;
+}
+
 size_t compute_line_count(size_t linelength) {
   linelength /= sizeof(void *);
   double last_time = -1;
-  for (size_t guess = 16; guess <= 4096; guess <<= 1) {
+  size_t prev_guess = 0;
+  for (size_t guess = 32; guess <= 4096; guess += 32) {
+    if (!reasonable_guess(guess))
+      continue;
     vector<size_t> pattern(guess);
     for (size_t i = 0; i < guess; i++) {
       // see above
@@ -124,10 +161,11 @@ size_t compute_line_count(size_t linelength) {
     cout << "Guess: " << guess << " time: " << time << std::endl;
 
     if (last_time > 0 && last_time * 1.15 < time) {
-      cout << "Likely line count: " << guess / 2 << "\n\n";
-      return guess / 2;
+      cout << "Likely line count: " << prev_guess << "\n\n";
+      return prev_guess;
     }
     last_time = time;
+    prev_guess = guess;
   }
 
   return 0;
@@ -139,7 +177,7 @@ size_t compute_associativity(size_t linelength, size_t line_count) {
     if (line_count % guess != 0)
       continue; // Associativity must be uniform
 
-    size_t pattern_size = guess + 1;
+    size_t pattern_size = guess; // start=0 is not counted
     // If associativity = guess, then there are =guess different values, that
     // map to the same point. Since we try to map guess + 1 values, we should
     // encounter thrashing on every read.
@@ -167,7 +205,8 @@ size_t compute_associativity(size_t linelength, size_t line_count) {
 int main() {
   make_buffer(1 << 28);
   make_eater();
-  cout << "Guessing line length; expecting minor time increase on correct guess"
+  make_atomics(1 << 10);
+  cout << "Guessing line length; expecting major time decrease on correct guess"
        << std::endl;
   size_t linelength = compute_linelength();
   if (!linelength) {
@@ -175,7 +214,7 @@ int main() {
     return 1;
   }
 
-  cout << "Guessing line count; expecting minor time increase AFTER correct "
+  cout << "Guessing line count; expecting minor time increase after correct "
           "guess"
        << std::endl;
   size_t line_count = compute_line_count(linelength);
@@ -184,7 +223,7 @@ int main() {
     return 1;
   }
 
-  cout << "Guessing associativity; expecting MAJOR time increase on correct "
+  cout << "Guessing associativity; expecting major time increase on correct "
           "guess"
        << std::endl;
   size_t associativity = compute_associativity(linelength, line_count);
@@ -201,4 +240,5 @@ int main() {
 
   delete[] buffer;
   delete[] eater;
+  delete[] atomics;
 }

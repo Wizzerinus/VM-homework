@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -16,6 +17,7 @@ size_t BUFFER_SIZE = 0;
 const constexpr size_t EATER_SIZE = 1 << 26;
 const constexpr size_t FALSE_SHARING_TESTLEN = 1 << 26;
 ATOMIC_T *atomics = nullptr;
+unsigned char eaten_count = 0;
 
 void make_buffer(size_t size) {
   if (buffer != nullptr) {
@@ -82,8 +84,12 @@ void cycle(size_t cycles) {
 
 void eat_cache() {
   for (size_t i = 0; i < EATER_SIZE; i++) {
-    assert(eater[i] == static_cast<unsigned char>(i));
+    assert(eater[i] == static_cast<unsigned char>(i + eaten_count));
   }
+  for (size_t i = 0; i < EATER_SIZE; i++) {
+    eater[i]++;
+  }
+  eaten_count++;
 }
 
 double compute_time(size_t cycles, const std::vector<size_t> &pattern) {
@@ -140,14 +146,21 @@ size_t compute_linelength() {
 bool reasonable_guess(size_t guess) {
   while (guess % 2 == 0)
     guess >>= 1;
-  return guess < 8;
+  return guess < 6;
 }
+
+struct Guess {
+  double fraction;
+  size_t guess;
+};
 
 size_t compute_line_count(size_t linelength) {
   linelength /= sizeof(void *);
   double last_time = -1;
   size_t prev_guess = 0;
-  for (size_t guess = 32; guess <= 4096; guess += 32) {
+  vector<Guess> guesses;
+  guesses.push_back({1.0, 0});
+  for (size_t guess = 128; guess <= 1024; guess += 32) {
     if (!reasonable_guess(guess))
       continue;
     vector<size_t> pattern(guess - 1);
@@ -158,14 +171,28 @@ size_t compute_line_count(size_t linelength) {
     double time = compute_time(BUFFER_SIZE, pattern);
     cout << "Guess: " << guess << " time: " << time << std::endl;
 
-    if (last_time > 0 && last_time * 1.15 < time) {
-      cout << "Likely line count: " << prev_guess << "\n\n";
-      return prev_guess;
-    }
+    double frac = time / last_time;
+    if (frac > 0)
+      guesses.push_back({frac, prev_guess});
     last_time = time;
     prev_guess = guess;
   }
 
+  std::sort(guesses.begin(), guesses.end(), [](const Guess &l, const Guess &r) {
+    return r.fraction < l.fraction;
+  });
+  double best_fraction = guesses[0].fraction,
+         frac_delta = guesses[0].fraction - guesses[1].fraction;
+
+  if (best_fraction > 1.09 && frac_delta > 0.04) {
+    cout << "Likely line count: " << guesses[0].guess
+         << " (confidence fraction: " << best_fraction << ", gap " << frac_delta
+         << ")" << "\n\n";
+    return guesses[0].guess;
+  }
+
+  cout << "Unable to determine line count with good confidence (best fraction: "
+       << best_fraction << ", gap " << frac_delta << "), retrying...\n\n";
   return 0;
 }
 
@@ -215,9 +242,15 @@ int main() {
   cout << "Guessing line count; expecting minor time increase after correct "
           "guess"
        << std::endl;
-  size_t line_count = compute_line_count(linelength);
+
+  size_t line_count = 0;
+  for (size_t i = 0; i < 5 && line_count == 0; i++) {
+    line_count = compute_line_count(linelength);
+    if (!line_count)
+      eat_cache();
+  }
   if (!line_count) {
-    cout << "Unable to predict line count";
+    cout << "Unable to predict line count after 5 tries";
     return 1;
   }
 

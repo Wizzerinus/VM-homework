@@ -150,11 +150,9 @@ size_t compute_line_count(size_t linelength) {
   for (size_t guess = 32; guess <= 4096; guess += 32) {
     if (!reasonable_guess(guess))
       continue;
-    vector<size_t> pattern(guess);
-    for (size_t i = 0; i < guess; i++) {
-      // see above
-      size_t j = i % 2 == 0 ? 0 : (i % 4 == 1 ? 2 : -2);
-      pattern[i] = (i + 1 + j) * linelength;
+    vector<size_t> pattern(guess - 1);
+    for (size_t i = 0; i < guess - 1; i++) {
+      pattern[i] = (i + 1) * linelength;
     }
 
     double time = compute_time(BUFFER_SIZE, pattern);

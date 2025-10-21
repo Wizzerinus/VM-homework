@@ -94,15 +94,12 @@ size_t compute_linelength() {
   double last_time = -1;
   for (size_t guess = 16; guess <= 1024; guess <<= 1) {
     for (size_t i = 0; i < MAX_CACHE_LINES; i++) {
-      // j = 0: 1 2 3 4 5 6 7 8 ... - gets optimized by prefetcher
-      // w/  j: 1 4 3 2 5 8 7 6 ...
-      size_t j = i % 2 == 0 ? 0 : (i % 4 == 1 ? 2 : -2);
-      pattern[i] = (i + 1 + j) * guess / sizeof(void *);
+      pattern[i] = (i + 1) * (guess * 3 / 2) / sizeof(void *);
     }
 
     double time = compute_time(BUFFER_SIZE, pattern);
     cout << "Guess: " << guess << " time: " << time << std::endl;
-    if (last_time > 0 && last_time * 1.15 < time) {
+    if (last_time > 0 && last_time * 1.2 < time) {
       cout << "Likely line length: " << guess << "\n\n";
       return guess;
     }

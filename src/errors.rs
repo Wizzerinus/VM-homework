@@ -11,14 +11,6 @@ pub enum DecodeError {
 }
 
 #[derive(Debug)]
-#[allow(unused)]
-pub enum FixnumError {
-    NotAFixnum(u64),
-    NotAPositiveFixnum(u64),
-    FixnumOverflow(i64),
-}
-
-#[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
 #[allow(unused)]
 pub enum DisassemblyErrorImpl {
@@ -33,7 +25,6 @@ pub enum RuntimeError {
     BinopFailed(String),
     EmptyStack,
     FullStack,
-    FixnumError(FixnumError),
     EmptyMultiStack { expected: usize, obtained: usize },
     LoadAddrBanned,
     StoreRefBanned,

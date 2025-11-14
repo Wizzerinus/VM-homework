@@ -6,6 +6,7 @@ mod bytecode;
 mod errors;
 mod inspector;
 mod syntax;
+mod utils;
 
 fn main() {
     let args: Vec<_> = args().collect();
@@ -15,9 +16,13 @@ fn main() {
         .parse()
         .unwrap();
     let content = fs::read(&filename).expect("Unable to read the file");
-    let result = inspect_bytecode(&content)
-        .inspect_err(|e| println!("Error while inspecting: {:?}", e))
-        .unwrap();
+    let result = match inspect_bytecode(&content) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error while reading bytecode: {:?}", e);
+            return;
+        }
+    };
     let mut result_vec: Vec<_> = result.iter().collect();
     result_vec.sort_by_key(|k| (-(*k.1 as i32), k.0));
     for ((fst, snd), count) in result_vec {

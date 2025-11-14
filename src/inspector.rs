@@ -29,6 +29,7 @@ impl<'a> Inspector<'a> {
     fn inspect(mut self) -> Result<HashMap<(Bytecode, Bytecode), u32>, LamaError> {
         let mut last_bytecode: Option<Bytecode> = None;
         while let Some(x) = self.file.bytecode().decode()? {
+            // eprintln!("Got {}", x);
             if let Some(ref y) = last_bytecode {
                 self.add(y.clone(), x.clone());
             }
@@ -80,6 +81,7 @@ pub fn inspect_bytecode(value: &[u8]) -> Result<HashMap<(Bytecode, Bytecode), u3
         .try_into()
         .map_err(|k| LamaError::DisassemblyError { error: k })?;
 
+    // eprintln!("{}", bytefile);
     let inspector = Inspector::new(&mut bytefile);
     inspector.inspect()
 }

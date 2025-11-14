@@ -1,16 +1,9 @@
 use std::{ffi::CString, fmt::Display};
 
-use crate::errors::{DecodeError, FixnumError, LamaError};
-
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub(crate) struct Fixnum(u64);
-
-impl Default for Fixnum {
-    fn default() -> Self {
-        Self(1)
-    }
-}
+use crate::{
+    errors::{DecodeError, LamaError},
+    utils::{CStringFormattable, decode_cstring},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[allow(unused)]
@@ -182,17 +175,6 @@ pub(crate) enum Bytecode {
     // Public & Import not supported
 }
 
-struct CStringFormattable<'a>(&'a CString);
-
-impl<'a> Display for CStringFormattable<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0.to_str() {
-            Ok(s) => f.write_fmt(format_args!("{}", s)),
-            Err(_) => f.write_fmt(format_args!("{:x?}", self.0.to_bytes())),
-        }
-    }
-}
-
 impl Display for Bytecode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -252,51 +234,24 @@ impl Display for Bytecode {
     }
 }
 
-impl TryInto<i64> for Fixnum {
-    type Error = FixnumError;
-
-    fn try_into(self) -> Result<i64, Self::Error> {
-        if self.0 & 1 == 0 {
-            Err(FixnumError::NotAFixnum(self.0))
-        } else {
-            Ok((self.0 as i64) >> 1)
-        }
-    }
-}
-
-impl TryInto<usize> for Fixnum {
-    type Error = FixnumError;
-
-    fn try_into(self) -> Result<usize, Self::Error> {
-        let x: i64 = self.try_into()?;
-        x.try_into()
-            .map_err(|_| FixnumError::NotAPositiveFixnum(self.0))
-    }
-}
-
-impl TryFrom<i64> for Fixnum {
-    type Error = FixnumError;
-
-    fn try_from(value: i64) -> Result<Self, Self::Error> {
-        let value_u: u64 = value
-            .try_into()
-            .map_err(|_| FixnumError::FixnumOverflow(value))?;
-        let value_u_s = value_u
-            .checked_mul(2)
-            .ok_or(FixnumError::FixnumOverflow(value))?;
-        Ok(Fixnum(value_u_s + 1))
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Code<'a> {
     slice: &'a [u8],
     pos: usize,
+    strings: &'a [u8],
 }
 
 impl<'a> Code<'a> {
-    pub fn new(slice: &'a [u8]) -> Self {
-        Self { slice, pos: 0 }
+    pub fn new(slice: &'a [u8], strings: &'a [u8]) -> Self {
+        Self {
+            slice,
+            pos: 0,
+            strings,
+        }
+    }
+
+    pub fn restart(&mut self) {
+        self.pos = 0;
     }
 
     fn err(&self, error: DecodeError) -> LamaError {
@@ -307,7 +262,7 @@ impl<'a> Code<'a> {
     }
 
     fn advance<const N: usize>(&mut self) -> Result<&'a [u8; N], LamaError> {
-        if self.slice.len() < N {
+        if self.slice.len() < self.pos + N {
             return Err(self.err(DecodeError::NotEnoughBytes(N)));
         }
 
@@ -353,20 +308,8 @@ impl<'a> Code<'a> {
     }
 
     fn get_string(&mut self) -> Result<CString, LamaError> {
-        let mut idx = self.pos;
-        let mut xs: Vec<u8> = Vec::new();
-        while let Some(k) = self.slice.get(idx)
-            && *k != 0
-        {
-            xs.push(*k);
-            idx += 1;
-        }
-        if idx >= self.slice.len() {
-            Err(self.err(DecodeError::NoNullTerminator))
-        } else {
-            self.pos += idx + 1;
-            Ok(unsafe { CString::from_vec_unchecked(xs) })
-        }
+        let idx = self.get_usize()?;
+        decode_cstring(self.strings, idx).ok_or_else(|| self.err(DecodeError::NoNullTerminator))
     }
 
     pub(crate) fn decode_at(&mut self, pos: usize) -> Result<Bytecode, LamaError> {

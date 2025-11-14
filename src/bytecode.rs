@@ -1,8 +1,9 @@
-use std::pin::Pin;
+use std::fmt::Display;
 
 use crate::{
     errors::DisassemblyErrorImpl,
-    syntax::{Code, Fixnum},
+    syntax::Code,
+    utils::{CStringFormattable, decode_cstring_pool},
 };
 
 #[allow(unused)]
@@ -18,7 +19,39 @@ pub struct Bytefile<'a> {
     pub_symbols: Vec<PubSymbol>,
     strings: &'a [u8],
     bytecode: Code<'a>,
-    globals: Pin<Box<[Fixnum]>>,
+    globals_count: usize,
+}
+
+impl<'a> Display for Bytefile<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{} public symbols\n", self.pub_symbols.len()))?;
+
+        f.write_str("Strings:\n")?;
+        match decode_cstring_pool(self.strings) {
+            None => f.write_str("\t(unable to decode)")?,
+            Some(x) => {
+                for (idx, y) in x {
+                    f.write_fmt(format_args!("\t{:#06x}\t{}\n", idx, CStringFormattable(&y)))?;
+                }
+            }
+        };
+
+        f.write_str("Bytecode:\n")?;
+        let mut bc_clone = self.bytecode.clone();
+        bc_clone.restart();
+        loop {
+            match bc_clone.decode() {
+                Ok(None) => break,
+                Ok(Some(x)) => f.write_fmt(format_args!("\t{}\n", x))?,
+                Err(e) => {
+                    f.write_fmt(format_args!("\t(decoding error: {:?})", e))?;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<'a> TryFrom<&'a [u8]> for Bytefile<'a> {
@@ -68,8 +101,8 @@ impl<'a> TryFrom<&'a [u8]> for Bytefile<'a> {
         Ok(Self {
             pub_symbols,
             strings,
-            bytecode: Code::new(&value[12 + 8 * symbols_num + string_pool_size..]),
-            globals: Pin::new(vec![Fixnum::default(); glob_size].into_boxed_slice()),
+            bytecode: Code::new(&value[12 + 8 * symbols_num + string_pool_size..], strings),
+            globals_count: glob_size,
         })
     }
 }
